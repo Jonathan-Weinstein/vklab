@@ -13,3 +13,4 @@ for debug omit `-O1 -DNDEBUG`, add `-g -D_DEBUG`
 Should prob use glfw at some point so I can test on linux, see if that fence vs waitIdle thing occurs there.
 But not needing another lib on win32 is nice.
 
+[hooray triangles](hello.jpg)
