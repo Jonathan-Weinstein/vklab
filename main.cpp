@@ -17,6 +17,32 @@ inline float SmoothPoly3(float t)
     return t*t*(3 - 2*t);
 }
 
+struct vec2f { float x, y; };
+
+struct vec4f {
+    union {
+        struct {
+            float x, y, z, w;
+        };
+        struct {
+            vec2f xy, zw;
+        };
+    };
+};
+
+/*
+    Returns the cosine and sine using where [0, 1) revolutions maps to [0, 2pi) radians.
+*/
+inline vec2f cos_sin_tau(float revolutions)
+{
+    constexpr float Tau = float(3.14159265358979323846 * 2);
+    float radians = revolutions * Tau;
+    return {
+        cosf(radians),
+        sinf(radians)
+    };
+}
+
 struct App {
     // The swapchains present mode = (immediatePresentation ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR);
     // FIFO should be vsync with syncInterval=1
@@ -37,6 +63,214 @@ struct PerframeObjects {
     VkSemaphore swapchainImageAcquireSema;
     VkSemaphore swapchainImageReleaseSema;
 };
+
+struct SwapchainRenderables {
+    VkImageView view;
+    VkFramebuffer framebuffer; // no DSV or any resolve attatchments.
+};
+
+static void
+DestroySwapchainRenderables(VkDevice device, const SwapchainRenderables *a, unsigned n)
+{
+    for (unsigned i = 0; i < n; ++i) {
+        vkDestroyFramebuffer(device, a[i].framebuffer, nullptr);
+        vkDestroyImageView(device, a[i].view, nullptr);
+    }
+}
+
+// The VkRenderPass only has to be a compatible VkRenderPass
+static void
+CreateSwapchainRenderables(VkDevice device, SwapchainRenderables *a, const Swapchain& sc, VkRenderPass renderPass)
+{
+    VkImageViewCreateInfo viewCreateInfo = {
+        VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        nullptr,
+        0, // VkImageViewCreateFlags
+        nullptr, // VkImage, set in loop
+        VK_IMAGE_VIEW_TYPE_2D,
+        sc.format,
+        COMPONENT_MAPPING_IDENTITY,
+        FULL_IMAGE_RANGE_COLOR
+    };
+
+    VkFramebufferCreateInfo fbCreateInfo = {
+        VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+        nullptr,
+        0, // VkFramebufferCreateFlags
+        renderPass,
+        1, // uint32_t attachmentCount, set in loop
+        nullptr, // const VkImageView* pAttachments;
+        sc.lastCreatedExtent.width, sc.lastCreatedExtent.height, 1 // uint32_t width, height, layers;
+    };
+
+    for (unsigned i = 0; i < sc.imageCount; ++i) {
+        viewCreateInfo.image = sc.images[i];
+        vkCreateImageView(device, &viewCreateInfo, nullptr, &a[i].view);
+        fbCreateInfo.pAttachments = &a[i].view;
+        vkCreateFramebuffer(device, &fbCreateInfo, nullptr, &a[i].framebuffer);
+    }
+}
+
+
+static VkRenderPass
+CreateRenderPass(VkDevice device, VkFormat color0_format)
+{
+    const VkAttachmentDescription color0_desc = {
+        0, // VkAttachmentDescriptionFlags flags;
+        color0_format, // VkFormat format;
+        VK_SAMPLE_COUNT_1_BIT, // VkSampleCountFlagBits samples;
+        VK_ATTACHMENT_LOAD_OP_CLEAR, // VkAttachmentLoadOp loadOp;
+        VK_ATTACHMENT_STORE_OP_STORE, // VkAttachmentStoreOp storeOp;
+        VK_ATTACHMENT_LOAD_OP_DONT_CARE, //VkAttachmentLoadOp stencilLoadOp;
+        VK_ATTACHMENT_STORE_OP_DONT_CARE, // VkAttachmentStoreOp stencilStoreOp;
+        VK_IMAGE_LAYOUT_UNDEFINED, // VkImageLayout initialLayout, the layout before vkBeginRenderPass?
+        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR // VkImageLayout finalLayout, layout auto-changes to this after vkEndRenderPass?
+    };
+
+    const VkAttachmentReference color0_ref = {
+        0, // attatchment index
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL // layout auto-changes to this when this subpass begins?
+    };
+
+    const VkSubpassDescription subpassDesc = {
+        0, // VkSubpassDescriptionFlags flags;
+        VK_PIPELINE_BIND_POINT_GRAPHICS, // VkPipelineBindPoint pipelineBindPoint;
+        0, // uint32_t inputAttachmentCount;
+        nullptr, // const VkAttachmentReference* pInputAttachments;
+        1, // num color refs
+        &color0_ref,
+        nullptr, // const VkAttachmentReference* pResolveAttachments;
+        nullptr, // const VkAttachmentReference* pDepthStencilAttachment;
+        0, //  preserveAttachmentCount;
+        nullptr // const uint32_t* pPreserveAttachments, why isnt this and the above parameter just a bitset?
+    };
+
+    const VkRenderPassCreateInfo rpCreateInfo = {
+        VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+        nullptr,
+        0, // VkRenderPassCreateFlags flags;
+        1, //uint32_t attachmentCount;
+        &color0_desc, // const VkAttachmentDescription* pAttachments;
+        1, // uint32_t subpassCount;
+        &subpassDesc, // const VkSubpassDescription* pSubpasses;
+        0, // uint32_t dependencyCount,  explicit deps
+        nullptr // const VkSubpassDependency* pDependencies, explicit deps
+    };
+
+    VkRenderPass rp = 0;
+    VK_CHECK(vkCreateRenderPass(device, &rpCreateInfo, nullptr, &rp));
+    return rp;
+}
+
+static VkPipeline
+CreatePipeline(VkDevice device, VkPipelineCache cache, VkPipelineLayout psoLayout,
+               VkRenderPass renderPass, uint32_t subpass,
+               VkShaderModule vs, VkShaderModule fs)
+{
+    VkPipelineShaderStageCreateInfo stages[2];
+    stages[1] = stages[0] = {
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        nullptr,
+        0, // VkPipelineShaderStageCreateFlags flags;
+        VkShaderStageFlagBits(0),
+        nullptr, // VkShaderModule module;
+        "main", // const char* pName;
+        nullptr // const VkSpecializationInfo* pSpecializationInfo;
+    };
+
+    stages[0].module = vs;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+
+    stages[1].module = fs;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    // no attributes
+    VkPipelineVertexInputStateCreateInfo vertex_input = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+
+    // Specify we will use triangle lists to draw geometry.
+    VkPipelineInputAssemblyStateCreateInfo input_assembly = {
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        nullptr,
+        0, // flags
+        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        false // primitive restart enabled.
+    };
+
+    // Specify rasterization state.
+    VkPipelineRasterizationStateCreateInfo raster = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    raster.cullMode  = VK_CULL_MODE_NONE;
+    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    raster.lineWidth = 1.0f;
+
+    // Our attachment will write to all color channels, but no blending is enabled.
+    VkPipelineColorBlendAttachmentState blend_attachment = {
+        false // blend enabled
+        // ...
+    };
+    blend_attachment.colorWriteMask = 0xf;
+
+    VkPipelineColorBlendStateCreateInfo blend = {
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        nullptr,
+        0, // flags
+        false, // logicOpEnable;
+        VkLogicOp(0),
+        1, // attachmentCount;
+        &blend_attachment,
+        {0.0f, 0.0f, 0.0f, 0.0f} // float blendConstants[4], can be dynamic state.
+    };
+
+    // We will have one viewport and scissor box.
+    // the values for the rects are set dynamically.
+    const VkPipelineViewportStateCreateInfo viewport = {
+        VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        nullptr,
+        0, // flags
+        1, nullptr, // viewport count and values
+        1, nullptr // scissor count and values
+    };
+
+    // Disable all depth testing.
+    VkPipelineDepthStencilStateCreateInfo depth_stencil ={ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+
+    // No multisampling.
+    VkPipelineMultisampleStateCreateInfo multisample = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    // Specify that these states will be dynamic, i.e. not part of pipeline state object.
+    const VkDynamicState dynamics[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+
+    VkPipelineDynamicStateCreateInfo dynamic = {
+        VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0,
+        lengthof(dynamics), dynamics
+    };
+
+    VkGraphicsPipelineCreateInfo psoInfo = {
+        VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        nullptr,
+        0, // flags
+        lengthof(stages), // uint32_t stageCount;
+        stages,
+        &vertex_input,
+        &input_assembly,
+        nullptr,
+        &viewport,
+        &raster,
+        &multisample,
+        &depth_stencil,
+        &blend,
+        &dynamic,
+        psoLayout,
+        renderPass,
+        subpass, // One can't use the same PSO in two different subpasses of a renderPass.
+        nullptr, // VkPipeline basePipelineHandle;
+        0, // int32_t basePipelineIndex;
+    };
+
+    VkPipeline pso = nullptr;
+    VK_CHECK(vkCreateGraphicsPipelines(device, cache, 1, &psoInfo, nullptr, &pso));
+    return pso;
+}
 
 App app;
 Window window;
@@ -75,6 +309,25 @@ static void OnPaint(void *, int, int, int, int)
     puts(__FUNCTION__);
 }
 
+const uint32_t * get_hello_vertex_spirv(size_t *pBytesize);
+const uint32_t * get_hello_fragment_spirv(size_t *pBytesize);
+
+struct PushConstants {
+    vec4f m;
+    vec4f translation; // .zw unused, pad out
+};
+
+/*
+Okay, heres how I think push constants work:
+
+    - Each VkPipelineLayout (not VkPipeline?) has its own blob of at least 128 bytes.
+    - Unlike glUniform, push constants are NOT (I think) preserved, though not sure when they becomes invalid.
+    - vkCmdPushConstants uploads to that by specifying absolute offsets.
+    - Each shader stage can carve out a range from the blob. A range can also be
+    used by multiple stages, but a stage can only access a single range.
+
+*/
+
 int main(int argc, char **argv)
 {
     /*  Starting with VK_PRESENT_MODE_IMMEDIATE_KHR and useFences==true seems better than the vkDeviceWaitIdle.
@@ -110,7 +363,7 @@ int main(int argc, char **argv)
         mainReturnCode = int(err);
         goto L_destroy_surface_and_swapchain;
     }
-    VK_CHECK(Swapchain_InitParams(sc, vkr.physicalDevice, VK_IMAGE_USAGE_TRANSFER_DST_BIT)); // lets try vkCmdClearColorImage first.
+    VK_CHECK(Swapchain_InitParams(sc, vkr.physicalDevice, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT));
 
     window.user_ptr = nullptr; // app is global for now
     window.user_cb = {
@@ -128,6 +381,39 @@ int main(int argc, char **argv)
         };
 
         PerframeObjects perframe[PERFRAME_CAPACITY];
+
+        SwapchainRenderables swapchainRenderables[4];
+
+        VkRenderPass renderPass = CreateRenderPass(vkr.device, sc.format);
+
+        const uint32_t *pCode;
+        size_t codeByteSize;
+
+        pCode = get_hello_vertex_spirv(&codeByteSize);
+        VkShaderModule helloVS = VKH_CreateShaderModule(vkr.device, pCode, codeByteSize);
+        pCode = get_hello_fragment_spirv(&codeByteSize);
+        VkShaderModule helloFS = VKH_CreateShaderModule(vkr.device, pCode, codeByteSize);
+
+        VkPushConstantRange vsPushConstantsRange = {
+            VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(PushConstants)
+        };
+
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo = {
+            VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+        };
+        pipelineLayoutInfo.pushConstantRangeCount = 1;
+        pipelineLayoutInfo.pPushConstantRanges = &vsPushConstantsRange;
+
+        VkPipelineLayout pipelineLayout = nullptr;
+        VK_CHECK(vkCreatePipelineLayout(vkr.device, &pipelineLayoutInfo, nullptr, &pipelineLayout));
+
+        VkPipeline pso = CreatePipeline(vkr.device, VkPipelineCache(nullptr), pipelineLayout, renderPass, 0,
+            helloVS, helloFS);
+
+        // ShaderModules can be destroyed after creating all pipelines that used them.
+
+        vkDestroyShaderModule(vkr.device, helloFS, nullptr);
+        vkDestroyShaderModule(vkr.device, helloVS, nullptr);
 
         for (PerframeObjects& pf : perframe) {
             // Consider VK_COMMAND_POOL_CREATE_TRANSIENT_BIT ?
@@ -171,24 +457,33 @@ int main(int argc, char **argv)
 
             if (app.windowSize != sc.lastCreatedExtent || app.bDirtyVsync) {
                 app.bDirtyVsync = false;
+
+                unsigned oldNumImages = sc.imageCount;
                 VkSwapchainKHR oldSwapchain = sc.swapchain;
                 VkPresentModeKHR presentMode = app.bImmediatePresentation ?
                                                VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
                 VkResult createSwapcainRes = Swapchain_Create(sc, vkr.physicalDevice, vkr.device, app.windowSize, presentMode);
                 VK_CHECK(createSwapcainRes);
+                if (sc.imageCount > lengthof(swapchainRenderables)) {
+                    return 1;
+                }
+
                 if (oldSwapchain) {
                     vkDeviceWaitIdle(vkr.device);
+                    DestroySwapchainRenderables(vkr.device, swapchainRenderables, oldNumImages);
                     vkDestroySwapchainKHR(vkr.device, oldSwapchain, nullptr);
                 }
+
+                CreateSwapchainRenderables(vkr.device, swapchainRenderables, sc, renderPass);
             }
 
             os_tick_t const updateBeginTicks = OS_GetTicks();
-            /* Do something that pulses between cyan and yellow. IDK if sRGB is applied here if the image fomrat is SRGB. */
             float elapsedSecs = float(updateBeginTicks - AppBeginTicks) * SecsPerTickF32;
-            float t = Mod(elapsedSecs, 2.0f);
+            float t = Mod(elapsedSecs*0.25, 2.0f);
             t = t < 1.0f ? t : 2.0f - t;
             t = SmoothPoly3(t);
-            VkClearColorValue color = { t, 1, 1-t, 1 };
+            float c = t * 0.25f;
+            VkClearValue clearValue = { VkClearColorValue{ c, c, c, 1 } };
 
             unsigned const pfi = frameCounter % PERFRAME_CAPACITY;
 
@@ -229,52 +524,46 @@ int main(int argc, char **argv)
 
             VK_CHECK(vkBeginCommandBuffer(commandBuffer, &beginInfo));
 
-            /* change layout to DST_OPTIMAL */
-            {
-                VkImageMemoryBarrier beforeColorClearImageBarrier = {
-                    VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                    nullptr,
-                    0, // srcAccessMask
-                    0, // dstAccessMask
-                    VK_IMAGE_LAYOUT_UNDEFINED, // oldLayout, UNDEFINED is always allowed and means don't care about its contents.
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, // newLayout
-                    vkr.families.universal, // srcQueueFamilyIndex, this could be a seperate family in some cases.
-                    vkr.families.universal, // dstQueueFamilyIndex
-                    sc.images[imageIndex],
-                    FULL_IMAGE_RANGE_COLOR
-                };
-                /* IDK what src stage should be, the image should not be in use before submitting this command buffer.
-                   TOP_OF_PIPE_BIT is generally the fastest thing.
-                 */
-                vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                                     0, nullptr, 0, nullptr, 1, &beforeColorClearImageBarrier);
-            }
+            VkRect2D const renderRect = { {0, 0}, app.windowSize };
 
-            VkImageSubresourceRange clearRange = FULL_IMAGE_RANGE_COLOR;
-            vkCmdClearColorImage(commandBuffer, sc.images[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &clearRange);
+            VkRenderPassBeginInfo rp_begin = {
+                VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, nullptr,
+                renderPass,
+                swapchainRenderables[imageIndex].framebuffer,
+                renderRect,
+                1, &clearValue // array of VkClearValue, indexed by attatchment indicies
+            };
+            // We will add draw commands in the same command buffer.
+            vkCmdBeginRenderPass(commandBuffer, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
 
-            /* Wait for execution of STAGE_TRANSFER_BIT and change layout from DST_OPTIMAL -> PRESENT_SRC_KHR */
-            {
-                VkImageMemoryBarrier beforePresentBarrier = {
-                    VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                    nullptr,
-                    VK_ACCESS_TRANSFER_WRITE_BIT,
-                    0,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                    vkr.families.universal,
-                    vkr.families.universal, // this could be a seperate family in some cases.
-                    sc.images[imageIndex],
-                    FULL_IMAGE_RANGE_COLOR
-                };
-                /* Not sure about dest pipeline stage. */
-                vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
-                                     0, nullptr, 0, nullptr, 1, &beforePresentBarrier);
-            }
+            // Bind the graphics pipeline.
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
+
+            VkViewport vp = { 0, 0, float(app.windowSize.width), float(app.windowSize.height), 0.0f, 1.0f };
+            vkCmdSetViewport(commandBuffer, 0, 1, &vp); // first, count
+            vkCmdSetScissor(commandBuffer, 0, 1, &renderRect); // first, count
+
+            vec2f const U = cos_sin_tau(t);
+
+            PushConstants pcData;
+            pcData.m.xy = U;
+            pcData.m.zw = { -U.y, U.x }; // CCW perpendicular == (UnitZ cross {U.x, U.y, 0}).xy
+            pcData.translation = { t - 0.5f, 0 };
+            vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof pcData, &pcData);
+            vkCmdDraw(commandBuffer, 3, 1, 0, 0); // Draw three vertices with one instance.
+            pcData.m.x *= -1;
+            pcData.m.y *= -1;
+            pcData.translation = { 0, t - 0.5f };
+            vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof pcData, &pcData);
+            vkCmdDraw(commandBuffer, 3, 1, 0, 0); // Draw three vertices with one instance.
+
+            // Complete render pass, changes image layout to PRESENT_SRC
+            vkCmdEndRenderPass(commandBuffer);
+
             VK_CHECK(vkEndCommandBuffer(commandBuffer));
 
             /* Wait on the semaphore to be signaled before executing this stage: */
-            VkPipelineStageFlags waitDstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            VkPipelineStageFlags waitDstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 
             VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
             submitInfo.waitSemaphoreCount = 1;
@@ -310,6 +599,12 @@ int main(int argc, char **argv)
         } // end main loop
 
         vkDeviceWaitIdle(vkr.device);
+
+        DestroySwapchainRenderables(vkr.device, swapchainRenderables, sc.imageCount);
+        vkDestroyPipeline(vkr.device, pso, nullptr);
+        vkDestroyPipelineLayout(vkr.device, pipelineLayout, nullptr);
+        vkDestroyRenderPass(vkr.device, renderPass, nullptr);
+
         for (PerframeObjects& pf : perframe) {
             vkDestroyCommandPool(vkr.device, pf.commandPool, nullptr);
 
@@ -320,7 +615,6 @@ int main(int argc, char **argv)
         }
     }
 
-    vkDeviceWaitIdle(vkr.device);
 L_destroy_surface_and_swapchain:
     Swapchain_DestroySwapchainAndSurface(sc, vkr.instance, vkr.device);
 L_destroy_vkcore:

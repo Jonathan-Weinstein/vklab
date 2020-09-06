@@ -63,6 +63,23 @@ VKH_CreateCommandPool(VkDevice device, VkCommandPoolCreateFlags flags, uint32_t 
 VkCommandBuffer
 VKH_AllocateCommandBuffer(VkDevice device, VkCommandPool cmdPool, VkCommandBufferLevel level);
 
+inline VkShaderModule
+VKH_CreateShaderModule(VkDevice device, const void *pCode, size_t nBytes)
+{
+    /* 3/5 of this is useless... */
+    const VkShaderModuleCreateInfo info = {
+        VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        nullptr,
+        0, // flags
+        nBytes,
+        static_cast<const uint32_t *>(pCode)
+    };
+    VkShaderModule shader = 0;
+    VK_CHECK(vkCreateShaderModule(device, &info, nullptr, &shader));
+    return shader;
+}
 
 //{ VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS }
 #define FULL_IMAGE_RANGE_COLOR VkImageSubresourceRange{ 1, 0, 0xffffffffu, 0, 0xffffffffu }
+//{ VK_COMPONENT_SWIZZLE_IDENTITY... } = { 0... }
+#define COMPONENT_MAPPING_IDENTITY VkComponentMapping{}

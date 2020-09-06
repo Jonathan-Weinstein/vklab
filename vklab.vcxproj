@@ -149,6 +149,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="shaders.cpp" />
     <ClCompile Include="vk_procs.cpp" />
     <ClCompile Include="VulkanSwapchain.cpp" />
     <ClCompile Include="VulkanRenderer.cpp" />
